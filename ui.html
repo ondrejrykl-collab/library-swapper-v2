@@ -1,0 +1,278 @@
+<!doctype html>
+<html>
+<head>
+  <script>
+    try {
+      window.localStorage.getItem('x')
+    } catch (e) {
+      var store = new Map()
+      var shim = {
+        getItem: function(k) { return store.has(k) ? store.get(k) : null },
+        setItem: function(k, v) { store.set(k, String(v)) },
+        removeItem: function(k) { store.delete(k) },
+        clear: function() { store.clear() },
+        key: function(i) { return Array.from(store.keys())[i] || null },
+        get length() { return store.size },
+      }
+      Object.defineProperty(window, 'localStorage', { value: shim, configurable: true })
+    }
+  </script>
+  <style>
+    html, body { margin: 0; padding: 0; height: auto; min-height: 0; }
+    #plugin-root { height: auto; }
+    body { display: block; }
+    .info {
+      font-family: var(--font-family);
+      font-size: var(--body-small-fontSize);
+      color: var(--figma-color-text-secondary);
+      padding: var(--spacer-1) var(--spacer-3);
+      line-height: 1.5;
+      margin: 0;
+    }
+    .ok { color: var(--figma-color-text-success, #0fa958); }
+    .warn { color: var(--figma-color-text-warning, #b35c00); }
+    .err { color: var(--figma-color-text-danger, #e53935); }
+    .tag {
+      display: inline-block; font-family: var(--font-family); font-size: 11px;
+      border-radius: 4px; padding: 2px 6px; margin: 1px 2px;
+      cursor: pointer; user-select: none; transition: opacity 0.15s;
+    }
+    .tag:hover { opacity: 0.8; }
+    .tag.active { outline: 2px solid var(--figma-color-border-selected, #0d99ff); outline-offset: 1px; }
+    .tag.ok { background: #e8f5e9; color: #2e7d32; }
+    .tag.warn { background: #fff3e0; color: #e65100; }
+    .tag.err { background: #ffebee; color: #c62828; }
+    .tag.neutral { background: var(--figma-color-bg-secondary); color: var(--figma-color-text-secondary); }
+    .summary-bar {
+      display: flex; gap: 8px; padding: var(--spacer-1) var(--spacer-3);
+      flex-wrap: wrap;
+    }
+    .results-list {
+      max-height: 500px; overflow-y: auto;
+      border-top: 1px solid var(--figma-color-border);
+    }
+    .result-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 4px var(--spacer-3); cursor: pointer;
+    }
+    .result-row:hover { background: var(--figma-color-bg-secondary); }
+    .result-name {
+      font-family: var(--font-family); font-size: var(--body-small-fontSize);
+      color: var(--figma-color-text); flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .result-meta {
+      font-family: var(--font-family); font-size: 11px;
+      color: var(--figma-color-text-secondary);
+      white-space: nowrap; margin-left: 8px;
+    }
+    .hidden { display: none !important; }
+    .desc {
+      font-family: var(--font-family);
+      font-size: var(--body-small-fontSize);
+      color: var(--figma-color-text-secondary);
+      padding: var(--spacer-2) var(--spacer-3);
+      line-height: 1.5;
+    }
+    .desc strong { color: var(--figma-color-text); }
+    .action-group {
+      display: flex; gap: 6px; padding: 0 var(--spacer-3) var(--spacer-2);
+      flex-wrap: wrap;
+    }
+    .action-group fig-button { flex: 1; min-width: 0; }
+  </style>
+</head>
+<body>
+  <div id="plugin-root">
+    <fig-content>
+      <fig-group name="Library Swapper v2">
+        <p class="desc">
+          Swaps deprecated component instances to the new <strong>Components</strong> and <strong>Compositions</strong> libraries.
+          Enhanced swap preserves <strong>text overrides</strong> — text content is saved before swap and restored after.
+        </p>
+      </fig-group>
+
+      <fig-group name="Scope">
+        <fig-field>
+          <label>What to process</label>
+          <fig-options id="scope" options="Selection, Entire page" value="Selection"></fig-options>
+        </fig-field>
+      </fig-group>
+
+      <fig-group name="Actions">
+        <div class="action-group">
+          <fig-button id="btn-swap-preview" variant="secondary">Preview</fig-button>
+          <fig-button id="btn-swap" variant="primary">Swap</fig-button>
+        </div>
+      </fig-group>
+
+      <div id="results-section" class="hidden">
+        <fig-group name="Results">
+          <div class="summary-bar" id="summary-bar"></div>
+          <div class="results-list" id="results-list"></div>
+        </fig-group>
+      </div>
+    </fig-content>
+
+    <fig-footer>
+      <label id="footer-status">Select frames, then Preview or Swap</label>
+    </fig-footer>
+  </div>
+
+  <script>
+    var lastReportedHeight = 0
+    var resizeRaf = 0
+
+    function measurePanelHeight() {
+      var root = document.getElementById('plugin-root')
+      if (!root) return 0
+      return Math.ceil(root.getBoundingClientRect().height)
+    }
+
+    function reportHeight() {
+      var h = measurePanelHeight()
+      if (h && h !== lastReportedHeight) {
+        lastReportedHeight = h
+        parent.postMessage({ pluginMessage: { type: 'resize', height: h } }, '*')
+      }
+    }
+
+    var rootEl = document.getElementById('plugin-root')
+    if (rootEl && typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(function() {
+        if (resizeRaf) cancelAnimationFrame(resizeRaf)
+        resizeRaf = requestAnimationFrame(reportHeight)
+      }).observe(rootEl)
+    }
+    new MutationObserver(function() {
+      if (resizeRaf) cancelAnimationFrame(resizeRaf)
+      resizeRaf = requestAnimationFrame(reportHeight)
+    }).observe(document.body, {
+      childList: true, attributes: true, subtree: true,
+    })
+
+    function post(msg) { parent.postMessage({ pluginMessage: msg }, '*') }
+    function $(id) { return document.getElementById(id) }
+    function hide(id) { $(id).classList.add('hidden') }
+    function show(id) { $(id).classList.remove('hidden') }
+
+    var scopeMap = { 'Selection': 'selection', 'Entire page': 'page' }
+    var allBtns = ['btn-swap-preview', 'btn-swap']
+
+    function setAllBtnsDisabled(disabled) {
+      allBtns.forEach(function(id) {
+        if (disabled) $(id).setAttribute('disabled', '')
+        else $(id).removeAttribute('disabled')
+      })
+    }
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+    }
+
+    var lastDetails = []
+    var activeFilter = null
+
+    function makeFilterTag(text, cls, filterKey) {
+      var tag = document.createElement('span')
+      tag.className = 'tag ' + (cls || 'neutral')
+      tag.textContent = text
+      tag.dataset.filter = filterKey
+      tag.addEventListener('click', function() {
+        if (activeFilter === filterKey) {
+          activeFilter = null
+          tag.classList.remove('active')
+        } else {
+          activeFilter = filterKey
+          var allTags = $('summary-bar').querySelectorAll('.tag[data-filter]')
+          for (var i = 0; i < allTags.length; i++) allTags[i].classList.remove('active')
+          tag.classList.add('active')
+        }
+        renderList()
+      })
+      return tag
+    }
+
+    function renderList() {
+      var list = $('results-list')
+      list.innerHTML = ''
+      var order = { 'swapped': 0, 'error': 1, 'skipped': 2, 'already-new': 3 }
+      var sorted = lastDetails.slice().sort(function(a, b) {
+        return (order[a.status] || 9) - (order[b.status] || 9)
+      })
+      sorted.forEach(function(r) {
+        if (activeFilter && r.status !== activeFilter) return
+        var row = document.createElement('div')
+        row.className = 'result-row'
+        var statusCls = r.status === 'swapped' ? 'ok' : r.status === 'error' ? 'err' : ''
+        var meta = r.status === 'swapped' ? (r.newName || 'OK') : (r.reason || r.status)
+        var debugHtml = r.debug ? '<div style="font-size:10px;color:#888;word-break:break-all;padding:2px 0;white-space:normal;">' + esc(r.debug) + '</div>' : ''
+        row.innerHTML = '<div style="flex:1;min-width:0;"><span class="result-name" title="' + esc(r.componentName) + '">' + esc(r.componentName) + '</span>' + debugHtml + '</div>' +
+          '<span class="result-meta ' + statusCls + '">' + esc(meta) + '</span>'
+        if (r.nodeId) row.addEventListener('click', function() { post({ type: 'navigate', nodeId: r.nodeId }) })
+        list.appendChild(row)
+      })
+      requestAnimationFrame(reportHeight)
+    }
+
+    function getScope() {
+      return scopeMap[$('scope').value] || 'selection'
+    }
+
+    $('btn-swap-preview').addEventListener('click', function() {
+      post({ type: 'run', scope: getScope(), dryRun: true })
+    })
+    $('btn-swap').addEventListener('click', function() {
+      post({ type: 'run', scope: getScope(), dryRun: false })
+    })
+
+    window.onmessage = function(event) {
+      var msg = event.data.pluginMessage
+      if (!msg) return
+
+      if (msg.type === 'error') {
+        $('footer-status').textContent = msg.message
+        return
+      }
+
+      if (msg.type === 'running') {
+        $('footer-status').textContent = (msg.dryRun ? '[PREVIEW] ' : '') + 'Swapping...'
+        setAllBtnsDisabled(true)
+        hide('results-section')
+      }
+
+      if (msg.type === 'progress') {
+        var pct = msg.total > 0 ? Math.round(msg.count / msg.total * 100) : 0
+        $('footer-status').textContent = (msg.phase || 'Processing') + '... ' + msg.count + '/' + msg.total + ' (' + pct + '%)'
+      }
+
+      if (msg.type === 'results') {
+        setAllBtnsDisabled(false)
+        show('results-section')
+
+        lastDetails = msg.details
+        activeFilter = null
+
+        var bar = $('summary-bar')
+        bar.innerHTML = ''
+        if (msg.dryRun) {
+          var previewTag = document.createElement('span')
+          previewTag.className = 'tag warn'
+          previewTag.textContent = 'PREVIEW'
+          bar.appendChild(previewTag)
+        }
+        if (msg.swapped > 0) bar.appendChild(makeFilterTag(msg.swapped + ' swapped', 'ok', 'swapped'))
+        if (msg.skipped > 0) bar.appendChild(makeFilterTag(msg.skipped + ' skipped', 'neutral', 'skipped'))
+        if (msg.errors > 0) bar.appendChild(makeFilterTag(msg.errors + ' errors', 'err', 'error'))
+        if (msg.alreadyNew > 0) bar.appendChild(makeFilterTag(msg.alreadyNew + ' already new', 'neutral', 'already-new'))
+
+        renderList()
+
+        $('footer-status').textContent = msg.dryRun
+          ? 'Preview: ' + msg.swapped + ' would be swapped'
+          : 'Done! ' + msg.swapped + ' swapped'
+      }
+    }
+  </script>
+</body>
+</html>
