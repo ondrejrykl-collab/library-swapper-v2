@@ -1,4 +1,4 @@
-// Library Swapper v2 — main plugin logic
+// Library Swapper v2 — main plugin logic (v3: local master analysis)
 // Data maps extracted to separate files for readability:
 //   FULL_MAP  → data/full-map.json   (component name → {key, type, lib})
 //   EXCLUDE_KEYS → data/exclude-keys.json  (component keys to skip)
@@ -6,6 +6,11 @@
 // In the compiled Figma plugin, both are inlined as:
 //   const FULL_MAP: Record<string, {key:string; type:string; lib:string}> = { ... }
 //   const EXCLUDE_KEYS = new Set<string>([ ... ])
+//
+// v3 additions:
+//   - scanLocalMasters(): detects local components containing old-library remote instances
+//   - swapInsideMaster(): swaps remote instances inside master component definitions
+//   - Integrated into Preview/Swap flow with "Swap in all masters" / "Skip & continue" UI
 
 const TOOL_ID = 'library-swapper-v2'
 const DISPLAY_NAME = 'Library swapper v2'
@@ -690,6 +695,121 @@ async function scanAndSwap(rootNodes: readonly SceneNode[], dryRun: boolean): Pr
   return results
 }
 
+// ── LOCAL MASTER COMPONENT ANALYSIS ──
+// Finds local components (in the file) that contain remote instances needing swap
+interface LocalMasterInfo {
+  componentId: string
+  componentName: string
+  remoteInstanceCount: number
+  remoteInstances: Array<{ name: string; compName: string; verdict: string }>
+  instanceCount: number // how many instances of this local component exist in selection
+}
+
+async function scanLocalMasters(rootNodes: readonly SceneNode[]): Promise<LocalMasterInfo[]> {
+  // Step 1: Find all instances in the selection that use local components
+  const instances: InstanceNode[] = []
+  for (const node of rootNodes) {
+    if (node.type === 'INSTANCE') instances.push(node)
+    if ('findAll' in node) {
+      const found = (node as ChildrenMixin).findAll(n => n.type === 'INSTANCE') as InstanceNode[]
+      instances.push(...found)
+    }
+  }
+
+  // Track local components and how many instances of each exist
+  const localCompMap = new Map<string, { comp: ComponentNode | ComponentSetNode; count: number }>()
+
+  for (const inst of instances) {
+    const mc = await inst.getMainComponentAsync()
+    if (!mc || mc.remote) continue
+
+    // Get the "master" — either the ComponentSet parent or the Component itself
+    const master = mc.parent?.type === 'COMPONENT_SET' ? mc.parent as ComponentSetNode : mc
+    const masterId = master.id
+
+    const existing = localCompMap.get(masterId)
+    if (existing) {
+      existing.count++
+    } else {
+      localCompMap.set(masterId, { comp: master, count: 1 })
+    }
+  }
+
+  if (localCompMap.size === 0) return []
+
+  figma.ui.postMessage({ type: 'progress', count: 0, total: localCompMap.size, phase: 'Analyzing local components' })
+
+  // Step 2: For each local component, check if it contains remote instances that need swapping
+  const results: LocalMasterInfo[] = []
+  let idx = 0
+
+  for (const [masterId, entry] of localCompMap) {
+    const master = entry.comp
+    // Find all instances inside the master component definition
+    const innerInstances = master.findAll(n => n.type === 'INSTANCE') as InstanceNode[]
+    const remoteInstances: LocalMasterInfo['remoteInstances'] = []
+
+    for (const inner of innerInstances) {
+      const innerMc = await inner.getMainComponentAsync()
+      if (!innerMc || !innerMc.remote) continue
+
+      const parent = innerMc.parent
+      const csKey = parent?.type === 'COMPONENT_SET' ? (parent as ComponentSetNode).key : null
+      const mcKey = innerMc.key
+      const effectiveKey = csKey || mcKey
+      const csName = parent?.type === 'COMPONENT_SET' ? (parent as ComponentSetNode).name : null
+      const compName = csName || innerMc.name
+
+      // Check if this remote instance needs swapping
+      if (EXCLUDE_KEYS.has(mcKey) || (csKey && EXCLUDE_KEYS.has(csKey))) continue
+      if (NEW_LIB_KEYS.has(effectiveKey) || NEW_LIB_KEYS.has(mcKey)) {
+        remoteInstances.push({ name: inner.name, compName, verdict: 'needs-update' })
+        continue
+      }
+
+      const match = findMatch(compName, innerMc.name)
+      if (match) {
+        remoteInstances.push({ name: inner.name, compName, verdict: match.matchedName })
+      }
+      // If no match — it might be from a library we don't handle, skip silently
+    }
+
+    if (remoteInstances.length > 0) {
+      results.push({
+        componentId: masterId,
+        componentName: master.name,
+        remoteInstanceCount: remoteInstances.length,
+        remoteInstances,
+        instanceCount: entry.count,
+      })
+    }
+
+    idx++
+    if (idx % 10 === 0) {
+      figma.ui.postMessage({ type: 'progress', count: idx, total: localCompMap.size, phase: 'Analyzing local components' })
+      await new Promise(r => setTimeout(r, 0))
+    }
+  }
+
+  return results
+}
+
+// Swap remote instances INSIDE a local master component
+async function swapInsideMaster(componentId: string): Promise<SwapResult[]> {
+  const node = await figma.getNodeByIdAsync(componentId)
+  if (!node) return []
+
+  // The master component is either a Component or ComponentSet
+  // We need to find instances INSIDE it and swap them
+  const master = node as SceneNode & ChildrenMixin
+  const innerInstances = master.findAll(n => n.type === 'INSTANCE') as InstanceNode[]
+
+  // Use scanAndSwap on the master's children directly
+  // But we need to handle this carefully — we're modifying the master component definition
+  const results = await scanAndSwap(innerInstances, false)
+  return results
+}
+
 // ── MESSAGE HANDLER ──
 figma.ui.onmessage = async (msg: { type: string; [k: string]: unknown }) => {
   if (msg.type === 'resize') {
@@ -714,6 +834,21 @@ figma.ui.onmessage = async (msg: { type: string; [k: string]: unknown }) => {
     }
 
     figma.ui.postMessage({ type: 'running', dryRun })
+
+    // ── LOCAL MASTER CHECK (unless user opted to skip) ──
+    if (msg.skipMasterCheck !== true) {
+      const localMasters = await scanLocalMasters(roots)
+      if (localMasters.length > 0) {
+        figma.notify(localMasters.length + ' local component(s) contain old library instances — swap masters first')
+        figma.ui.postMessage({
+          type: 'local-masters-found',
+          masters: localMasters,
+          pendingDryRun: dryRun,
+          pendingScope: scope,
+        })
+        return
+      }
+    }
 
     // Multi-pass swap
     let allResults: SwapResult[] = []
@@ -761,5 +896,42 @@ figma.ui.onmessage = async (msg: { type: string; [k: string]: unknown }) => {
       figma.viewport.scrollAndZoomIntoView([node])
       figma.currentPage.selection = [node]
     }
+  }
+
+  // ── SWAP INSIDE LOCAL MASTERS ──
+  if (msg.type === 'swap-masters') {
+    const componentIds = msg.componentIds as string[]
+    if (!componentIds || componentIds.length === 0) return
+
+    figma.ui.postMessage({ type: 'running-swap-masters' })
+
+    let totalSwapped = 0
+    let totalErrors = 0
+    const allResults: SwapResult[] = []
+
+    for (let i = 0; i < componentIds.length; i++) {
+      figma.ui.postMessage({
+        type: 'progress',
+        count: i,
+        total: componentIds.length,
+        phase: 'Swapping in master ' + (i + 1) + '/' + componentIds.length,
+      })
+
+      const results = await swapInsideMaster(componentIds[i])
+      allResults.push(...results)
+      totalSwapped += results.filter(r => r.status === 'swapped').length
+      totalErrors += results.filter(r => r.status === 'error').length
+    }
+
+    figma.notify('Masters updated: ' + totalSwapped + ' swapped, ' + totalErrors + ' errors')
+
+    figma.notify('Masters updated: ' + totalSwapped + ' swapped, ' + totalErrors + ' errors. Click Preview/Swap to continue.')
+
+    figma.ui.postMessage({
+      type: 'swap-masters-result',
+      swapped: totalSwapped,
+      errors: totalErrors,
+      details: allResults,
+    })
   }
 }
