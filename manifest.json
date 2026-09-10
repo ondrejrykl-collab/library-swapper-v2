@@ -1,0 +1,12 @@
+{
+  "name": "Library swapper v2",
+  "id": "707e6b66-f98f-4ebb-8b40-f050c3a8d2d4",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "documentAccess": "dynamic-page",
+  "editorType": ["figma"],
+  "relaunchButtons": [
+    { "command": "library-swapper-v2", "name": "Library swapper v2" }
+  ]
+}
