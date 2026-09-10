@@ -80,6 +80,49 @@
       flex-wrap: wrap;
     }
     .action-group fig-button { flex: 1; min-width: 0; }
+    /* Local masters warning */
+    .masters-warning {
+      background: #fff8e1;
+      border: 1px solid #ffe082;
+      border-radius: 6px;
+      margin: 0 var(--spacer-3) var(--spacer-2);
+      padding: var(--spacer-2);
+    }
+    .masters-warning-title {
+      font-family: var(--font-family);
+      font-size: var(--body-small-fontSize);
+      font-weight: 600;
+      color: #e65100;
+      margin: 0 0 4px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .masters-warning-desc {
+      font-family: var(--font-family);
+      font-size: 11px;
+      color: #6d4c00;
+      line-height: 1.5;
+      margin: 0 0 8px;
+    }
+    .masters-list {
+      max-height: 200px; overflow-y: auto;
+    }
+    .master-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 3px 0; cursor: pointer;
+      font-family: var(--font-family); font-size: 11px;
+    }
+    .master-row:hover { opacity: 0.7; }
+    .master-name {
+      color: #4e342e; flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .master-badge {
+      font-size: 10px; color: #e65100; white-space: nowrap; margin-left: 6px;
+    }
+    .masters-actions {
+      display: flex; gap: 6px; margin-top: 8px;
+    }
+    .masters-actions fig-button { flex: 1; min-width: 0; }
   </style>
 </head>
 <body>
@@ -105,6 +148,22 @@
           <fig-button id="btn-swap" variant="primary">Swap</fig-button>
         </div>
       </fig-group>
+
+      <!-- Local Masters Warning Section -->
+      <div id="masters-section" class="hidden">
+        <div class="masters-warning">
+          <p class="masters-warning-title">⚠ Local components with old library instances</p>
+          <p class="masters-warning-desc">
+            These local components contain instances from the old library.
+            <strong>Swap in masters first</strong> — changes propagate to all instances automatically.
+          </p>
+          <div class="masters-list" id="masters-list"></div>
+          <div class="masters-actions">
+            <fig-button id="btn-swap-all-masters" variant="primary">Swap in all masters</fig-button>
+            <fig-button id="btn-skip-masters" variant="secondary">Skip & continue</fig-button>
+          </div>
+        </div>
+      </div>
 
       <div id="results-section" class="hidden">
         <fig-group name="Results">
@@ -157,12 +216,16 @@
     function show(id) { $(id).classList.remove('hidden') }
 
     var scopeMap = { 'Selection': 'selection', 'Entire page': 'page' }
-    var allBtns = ['btn-swap-preview', 'btn-swap']
+    var allBtns = ['btn-swap-preview', 'btn-swap', 'btn-swap-all-masters', 'btn-skip-masters']
+    var pendingDryRun = false
+    var pendingScope = 'selection'
 
     function setAllBtnsDisabled(disabled) {
       allBtns.forEach(function(id) {
-        if (disabled) $(id).setAttribute('disabled', '')
-        else $(id).removeAttribute('disabled')
+        var el = $(id)
+        if (!el) return
+        if (disabled) el.setAttribute('disabled', '')
+        else el.removeAttribute('disabled')
       })
     }
 
@@ -172,6 +235,7 @@
 
     var lastDetails = []
     var activeFilter = null
+    var lastMasters = []
 
     function makeFilterTag(text, cls, filterKey) {
       var tag = document.createElement('span')
@@ -215,6 +279,20 @@
       requestAnimationFrame(reportHeight)
     }
 
+    function renderMastersList() {
+      var list = $('masters-list')
+      list.innerHTML = ''
+      lastMasters.forEach(function(m) {
+        var row = document.createElement('div')
+        row.className = 'master-row'
+        row.innerHTML = '<span class="master-name" title="' + esc(m.componentName) + '">' + esc(m.componentName) + '</span>' +
+          '<span class="master-badge">' + m.remoteInstanceCount + ' old lib · ' + m.instanceCount + ' instances</span>'
+        row.addEventListener('click', function() { post({ type: 'navigate', nodeId: m.componentId }) })
+        list.appendChild(row)
+      })
+      requestAnimationFrame(reportHeight)
+    }
+
     function getScope() {
       return scopeMap[$('scope').value] || 'selection'
     }
@@ -225,6 +303,16 @@
     $('btn-swap').addEventListener('click', function() {
       post({ type: 'run', scope: getScope(), dryRun: false })
     })
+    $('btn-swap-all-masters').addEventListener('click', function() {
+      if (lastMasters.length === 0) return
+      var ids = lastMasters.map(function(m) { return m.componentId })
+      post({ type: 'swap-masters', componentIds: ids })
+    })
+    $('btn-skip-masters').addEventListener('click', function() {
+      hide('masters-section')
+      // Re-run the pending operation but skip master check
+      post({ type: 'run', scope: pendingScope, dryRun: pendingDryRun, skipMasterCheck: true })
+    })
 
     window.onmessage = function(event) {
       var msg = event.data.pluginMessage
@@ -232,18 +320,38 @@
 
       if (msg.type === 'error') {
         $('footer-status').textContent = msg.message
+        setAllBtnsDisabled(false)
         return
       }
 
-      if (msg.type === 'running') {
-        $('footer-status').textContent = (msg.dryRun ? '[PREVIEW] ' : '') + 'Swapping...'
+      if (msg.type === 'running' || msg.type === 'running-swap-masters') {
+        var label = msg.type === 'running-swap-masters' ? 'Swapping in masters...'
+          : (msg.dryRun ? '[PREVIEW] ' : '') + 'Scanning...'
+        $('footer-status').textContent = label
         setAllBtnsDisabled(true)
-        hide('results-section')
+        if (msg.type === 'running') { hide('results-section'); hide('masters-section') }
       }
 
       if (msg.type === 'progress') {
         var pct = msg.total > 0 ? Math.round(msg.count / msg.total * 100) : 0
         $('footer-status').textContent = (msg.phase || 'Processing') + '... ' + msg.count + '/' + msg.total + ' (' + pct + '%)'
+      }
+
+      if (msg.type === 'local-masters-found') {
+        setAllBtnsDisabled(false)
+        lastMasters = msg.masters || []
+        pendingDryRun = msg.pendingDryRun
+        pendingScope = msg.pendingScope || 'selection'
+        show('masters-section')
+        renderMastersList()
+        $('footer-status').textContent = lastMasters.length + ' local component(s) with old library instances — swap masters first or skip'
+      }
+
+      if (msg.type === 'swap-masters-result') {
+        setAllBtnsDisabled(false)
+        hide('masters-section')
+        lastMasters = []
+        $('footer-status').textContent = 'Masters updated! Click ' + (pendingDryRun ? 'Preview' : 'Swap') + ' to continue'
       }
 
       if (msg.type === 'results') {
